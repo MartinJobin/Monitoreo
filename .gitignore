@@ -3,4 +3,5 @@ node_modules/
 npm-debug.log*
 .DS_Store
 data/detractor-notes.json
+data/abandoned-notes.json
 *-check.png

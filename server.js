@@ -20,6 +20,7 @@ const ALERTS_CACHE_MS = 60 * 1000;
 const alertsCache = new Map();
 const DATA_DIR = path.join(__dirname, 'data');
 const DETRACTOR_NOTES_FILE = path.join(DATA_DIR, 'detractor-notes.json');
+const ABANDONED_NOTES_FILE = path.join(DATA_DIR, 'abandoned-notes.json');
 
 function loadEnv(file) {
   if (!fs.existsSync(file)) return;
@@ -56,6 +57,40 @@ function parseCsv(text) {
   if (value || row.length) { row.push(value); rows.push(row); }
   const headers = (rows.shift() || []).map((h, i) => h.trim() || `columna_${i + 1}`);
   return rows.map(cells => Object.fromEntries(headers.map((h, i) => [h, cells[i] ?? ''])));
+}
+
+function parseCsvMatrix(text) {
+  const rows = [];
+  let row = [], value = '', quoted = false;
+  for (let i = 0; i < text.length; i++) {
+    const ch = text[i];
+    if (quoted && ch === '"' && text[i + 1] === '"') { value += '"'; i++; }
+    else if (ch === '"') quoted = !quoted;
+    else if (ch === ',' && !quoted) { row.push(value); value = ''; }
+    else if ((ch === '\n' || ch === '\r') && !quoted) {
+      if (ch === '\r' && text[i + 1] === '\n') i++;
+      row.push(value); value = ''; rows.push(row); row = [];
+    } else value += ch;
+  }
+  if (value || row.length) { row.push(value); rows.push(row); }
+  return rows;
+}
+
+async function readMonitoringSchedule(force = false) {
+  const key = 'monitoringSchedule';
+  const stored = cache.get(key);
+  if (!force && stored?.payload && Date.now() - stored.at < CACHE_MS) return stored.payload;
+  const sheets = ['SEPTIEMBRE2026', 'OCTUBRE2026'];
+  const schedules = await Promise.all(sheets.map(async sheet => {
+    const response = await fetch(csvUrl(sheet, key), { signal: AbortSignal.timeout(60000) });
+    if (!response.ok) throw new Error(`${sheet}: Google Sheets respondió ${response.status}`);
+    const text = await response.text();
+    if (/<!doctype html|<html/i.test(text)) throw new Error(`${sheet}: la hoja requiere autorización`);
+    return { sheet, rows: parseCsvMatrix(text) };
+  }));
+  const payload = { source: 'sheet', schedules, updatedAt: new Date().toISOString() };
+  cache.set(key, { at: Date.now(), payload });
+  return payload;
 }
 
 async function readSheet(direction = 'incoming', force = false) {
@@ -125,6 +160,47 @@ function saveDetractorNotes(notes) {
   const temporary = `${DETRACTOR_NOTES_FILE}.tmp`;
   fs.writeFileSync(temporary, JSON.stringify(notes, null, 2), 'utf8');
   fs.renameSync(temporary, DETRACTOR_NOTES_FILE);
+}
+
+function readAbandonedNotes() {
+  try { return JSON.parse(fs.readFileSync(ABANDONED_NOTES_FILE, 'utf8')); }
+  catch { return []; }
+}
+
+function saveAbandonedNotes(notes) {
+  fs.mkdirSync(DATA_DIR, { recursive: true });
+  const temporary = `${ABANDONED_NOTES_FILE}.tmp`;
+  fs.writeFileSync(temporary, JSON.stringify(notes, null, 2), 'utf8');
+  fs.renameSync(temporary, ABANDONED_NOTES_FILE);
+}
+
+function normalizedPhone(value) {
+  let digits = String(value || '').replace(/\D/g, '');
+  if (digits.startsWith('593')) digits = digits.slice(3);
+  else if (digits.startsWith('0')) digits = digits.slice(1);
+  return digits;
+}
+
+async function readAbandonedCalls(force = false) {
+  const stored = cache.get('abandonedCalls');
+  if (!force && stored?.payload && Date.now() - stored.at < CACHE_MS) return stored.payload;
+  const [incoming, outgoing] = await Promise.all([readSheet('incoming', force), readSheet('outgoing', force)]);
+  const abandoned = incoming.rows.filter(row => /abandon|perdid|no contest/i.test(String(row.Estatus || row.Estado || row.Status || '')));
+  const phones = new Set(abandoned.map(row => normalizedPhone(row.Telefono || row['Teléfono'])).filter(Boolean));
+  const incomingRows = incoming.rows.filter(row => phones.has(normalizedPhone(row.Telefono || row['Teléfono']))).map(row => ({
+    FECHAENTRANTE: row.FECHAENTRANTE || row.Fecha, HORAENTRATE: row.HORAENTRATE || row.HORAENTRANTE || row.Hora,
+    Estatus: row.Estatus || row.Estado || row.Status, Telefono: row.Telefono || row['Teléfono'], Contacto: row.Contacto || row.Cliente,
+    COLA2: row.COLA2 || row.Cola || row['Nombre de Opción'], Agente: row.Agente, 'Tiempo de Espera': row['Tiempo de Espera'] || row.Espera,
+    'Identificador único': row['Identificador único']
+  }));
+  const outgoingRows = outgoing.rows.filter(row => phones.has(normalizedPhone(row.Telefono || row['Teléfono']))).map(row => ({
+    Fecha: row.Fecha, 'Estado de Llamada': row['Estado de Llamada'] || row.Estatus || row.Estado,
+    Telefono: row.Telefono || row['Teléfono'], Contacto: row.Contacto || row.Cliente,
+    'Grupo de Tareas': row['Grupo de Tareas'] || row.Cuenta, Agente: row.Agente, 'Identificador único': row['Identificador único']
+  }));
+  const payload = { incomingRows, outgoingRows, abandonedCount: abandoned.length, updatedAt: new Date().toISOString() };
+  cache.set('abandonedCalls', { at: Date.now(), payload });
+  return payload;
 }
 
 function readJsonBody(req, limit = 100000) {
@@ -213,6 +289,26 @@ const server = http.createServer(async (req, res) => {
       return sendJson(res, 201, { note });
     } catch (error) { return sendJson(res, 400, { error: error.message }); }
   }
+  if (url.pathname === '/api/abandoned-notes' && req.method === 'GET') {
+    const caseId = String(url.searchParams.get('caseId') || '').trim();
+    const notes = readAbandonedNotes().filter(note => !caseId || note.caseId === caseId);
+    return sendJson(res, 200, { notes });
+  }
+  if (url.pathname === '/api/abandoned-notes' && req.method === 'POST') {
+    try {
+      const body = await readJsonBody(req);
+      const caseId = String(body.caseId || '').trim(), phone = String(body.phone || '').trim(), text = String(body.text || '').trim();
+      if (!caseId || !phone || !text) return sendJson(res, 400, { error: 'El caso, el contacto y la novedad son obligatorios' });
+      const allowed = ['Pendiente', 'En gestión', 'Contactado', 'Cerrado'];
+      const note = { id: `${Date.now()}-${Math.random().toString(36).slice(2, 9)}`, caseId, phone, text: text.slice(0, 3000), author: String(body.author || 'Supervisor').trim().slice(0, 100) || 'Supervisor', status: allowed.includes(body.status) ? body.status : 'En gestión', createdAt: new Date().toISOString() };
+      const notes = readAbandonedNotes(); notes.push(note); saveAbandonedNotes(notes);
+      return sendJson(res, 201, { note });
+    } catch (error) { return sendJson(res, 400, { error: error.message }); }
+  }
+  if (url.pathname === '/api/abandoned-calls' && req.method === 'GET') {
+    try { return sendJson(res, 200, await readAbandonedCalls(url.searchParams.get('refresh') === '1')); }
+    catch (error) { return sendJson(res, 502, { error: error.message }); }
+  }
   if (url.pathname === '/api/alerts') {
     const datePattern = /^\d{4}-\d{2}-\d{2}$/;
     const today = new Date(), fallbackEnd = today.toISOString().slice(0, 10), fallbackStart = new Date(today.getTime() - 29 * 86400000).toISOString().slice(0, 10);
@@ -224,6 +320,10 @@ const server = http.createServer(async (req, res) => {
     const requestedDirection = url.searchParams.get('direction');
     const direction = requestedDirection === 'chatRatings' ? 'chatRatings' : requestedDirection === 'npsIncoming' ? 'npsIncoming' : requestedDirection === 'chat' ? 'chat' : requestedDirection === 'outgoing' ? 'outgoing' : 'incoming';
     return sendJson(res, 200, await readSheet(direction, url.searchParams.get('refresh') === '1'));
+  }
+  if (url.pathname === '/api/monitoring-schedule') {
+    try { return sendJson(res, 200, await readMonitoringSchedule(url.searchParams.get('refresh') === '1')); }
+    catch (error) { return sendJson(res, 502, { error: error.message }); }
   }
   serveFile(res, decodeURIComponent(url.pathname));
 });
